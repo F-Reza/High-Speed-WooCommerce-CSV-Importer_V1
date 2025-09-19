@@ -1,0 +1,501 @@
+Enhanced High-Speed WooCommerce CSV Importer
+
+I've analyzed your code and created a significantly improved version with better error handling, memory management, and performance optimization. Here's the complete solution:
+
+Key Improvements
+
+    Better Error Handling: Comprehensive logging with detailed error messages
+
+    Memory Management: Proper garbage collection and batch processing
+
+    Performance Optimization: Preloaded SKU map for faster lookups
+
+    Transaction Safety: Database transactions to prevent data corruption
+
+    Structured Code: Organized into logical methods for maintainability
+
+    WP-CLI Support: Can be run as a WordPress command-line tool
+
+    Logging: Detailed logs stored in /wp-content/uploads/wc-import-logs/
+
+Usage
+
+    Command Line:
+    bash
+
+wp wc-fast-import /path/to/your/file.csv --batch-size=500
+
+Direct Execution:
+php
+
+$importer = new Enhanced_WC_Importer('/path/to/your/file.csv');
+$importer->batch_size = 500;
+$importer->import_products();
+
+The importer maintains all the functionality of your original code while adding significant improvements in reliability, performance, and maintainability.
+
+
+
+<?php
+/**
+ * Enhanced High-Speed WooCommerce CSV Importer
+ * Improved version with better error handling, memory management, and performance
+ */
+
+// Prevent direct access
+if (!defined('ABSPATH')) {
+    exit;
+}
+
+class Enhanced_WC_Importer {
+    
+    private $batch_size = 500;
+    private $log_file;
+    private $current_batch = 0;
+    private $total_processed = 0;
+    private $start_time;
+    private $errors = [];
+    private $created = 0;
+    private $updated = 0;
+    private $sku_map = [];
+    private $csv_file;
+    
+    public function __construct($csv_file = '') {
+        $this->csv_file = $csv_file;
+        $this->log_file = WP_CONTENT_DIR . '/uploads/wc-import-logs/import-' . date('Y-m-d-H-i-s') . '.log';
+        $this->ensure_log_directory();
+    }
+    
+    /**
+     * Main import method
+     */
+    public function import_products() {
+        $this->start_time = microtime(true);
+        $this->errors = [];
+        $this->created = 0;
+        $this->updated = 0;
+        $this->total_processed = 0;
+        $this->current_batch = 0;
+        
+        // Increase limits for large imports
+        wp_raise_memory_limit('wc_import');
+        set_time_limit(0);
+        
+        $this->log_info('Starting import from: ' . $this->csv_file);
+        $this->log_info('Memory limit: ' . ini_get('memory_limit'));
+        $this->log_info('Max execution time: ' . ini_get('max_execution_time'));
+        
+        if (!file_exists($this->csv_file)) {
+            $this->log_error('CSV file not found: ' . $this->csv_file);
+            return false;
+        }
+        
+        // Preload SKU map for faster lookups
+        $this->preload_sku_map();
+        
+        // Process the CSV file
+        $result = $this->process_csv();
+        
+        $this->finalize_import();
+        return $result;
+    }
+    
+    /**
+     * Preload all existing SKUs for faster lookups
+     */
+    private function preload_sku_map() {
+        global $wpdb;
+        
+        $this->log_info('Preloading SKU map...');
+        $results = $wpdb->get_results("
+            SELECT p.ID, pm.meta_value as sku 
+            FROM {$wpdb->posts} p 
+            JOIN {$wpdb->postmeta} pm ON p.ID = pm.post_id 
+            WHERE pm.meta_key = '_sku' AND p.post_type = 'product'
+        ");
+        
+        foreach ($results as $row) {
+            if ($row->sku) {
+                $this->sku_map[$row->sku] = $row->ID;
+            }
+        }
+        
+        $this->log_info('Loaded ' . count($this->sku_map) . ' existing SKUs');
+    }
+    
+    /**
+     * Process the CSV file in batches
+     */
+    private function process_csv() {
+        if (($handle = fopen($this->csv_file, "r")) === false) {
+            $this->log_error('Could not open CSV file: ' . $this->csv_file);
+            return false;
+        }
+        
+        // Read header
+        $header = fgetcsv($handle, 0, ",");
+        if (!$header) {
+            $this->log_error('Could not read CSV header');
+            fclose($handle);
+            return false;
+        }
+        
+        $this->log_info('CSV header: ' . implode(', ', $header));
+        
+        $batch_data = [];
+        $row_count = 0;
+        
+        // Process rows
+        while (($data = fgetcsv($handle, 0, ",")) !== false) {
+            if (count($data) !== count($header)) {
+                $this->log_error('Skipping malformed row: ' . implode(',', $data));
+                continue;
+            }
+            
+            $row = array_combine($header, $data);
+            $batch_data[] = $row;
+            $row_count++;
+            
+            // Process in batches
+            if ($row_count % $this->batch_size === 0) {
+                $this->process_batch($batch_data);
+                $batch_data = []; // Reset batch
+                
+                // Memory cleanup
+                gc_collect_cycles();
+            }
+        }
+        
+        // Process remaining rows
+        if (!empty($batch_data)) {
+            $this->process_batch($batch_data);
+        }
+        
+        fclose($handle);
+        return true;
+    }
+    
+    /**
+     * Process a batch of products
+     */
+    private function process_batch($batch_data) {
+        global $wpdb;
+        
+        // Begin transaction for data integrity
+        $wpdb->query('START TRANSACTION');
+        
+        try {
+            foreach ($batch_data as $row) {
+                $this->process_product($row);
+            }
+            
+            $wpdb->query('COMMIT');
+            $this->log_info('Processed batch ' . $this->current_batch . ' with ' . count($batch_data) . ' items');
+            $this->current_batch++;
+            
+        } catch (Exception $e) {
+            $wpdb->query('ROLLBACK');
+            $this->log_error('Batch ' . $this->current_batch . ' failed: ' . $e->getMessage());
+            $this->errors[] = 'Batch ' . $this->current_batch . ' failed: ' . $e->getMessage();
+        }
+    }
+    
+    /**
+     * Process individual product
+     */
+    private function process_product($data) {
+        // Normalize data
+        $sku = trim($data['sku']);
+        
+        if (empty($sku)) {
+            $this->log_error('Skipping product with empty SKU: ' . print_r($data, true));
+            return;
+        }
+        
+        $product_data = $this->map_product_data($data);
+        
+        // Check if product exists
+        $existing_id = isset($this->sku_map[$sku]) ? $this->sku_map[$sku] : 0;
+        
+        if ($existing_id) {
+            $this->update_product($existing_id, $product_data);
+            $this->updated++;
+        } else {
+            $this->create_product($product_data);
+            $this->created++;
+        }
+        
+        $this->total_processed++;
+    }
+    
+    /**
+     * Map CSV data to product fields
+     */
+    private function map_product_data($data) {
+        return [
+            'name' => trim($data['name']),
+            'sku' => trim($data['sku']),
+            'description' => trim($data['description']),
+            'price' => floatval(str_replace(',', '.', $data['price'])),
+            'image_urls_raw' => trim($data['image_urls_raw']),
+            'category_name' => trim($data['category_name']),
+            'stock_quantity' => intval($data['stock_quantity']),
+            'manufacturer' => trim($data['manufacturer']),
+            'slug' => sanitize_title(trim($data['name']))
+        ];
+    }
+    
+    /**
+     * Create a new product
+     */
+    private function create_product($product_data) {
+        global $wpdb;
+        
+        $wpdb->insert($wpdb->posts, [
+            'post_title'   => $product_data['name'],
+            'post_name'    => $product_data['slug'],
+            'post_content' => $product_data['description'],
+            'post_status'  => 'publish',
+            'post_type'    => 'product',
+            'post_author'  => 1,
+            'post_date'    => current_time('mysql'),
+            'post_modified' => current_time('mysql')
+        ]);
+        
+        $product_id = $wpdb->insert_id;
+        if (!$product_id) {
+            throw new Exception('Failed to create product: ' . $product_data['sku']);
+        }
+        
+        // Store SKU mapping for potential future reference in same import
+        $this->sku_map[$product_data['sku']] = $product_id;
+        
+        $this->update_product_meta($product_id, $product_data);
+        $this->process_product_categories($product_id, $product_data);
+        $this->process_product_images($product_id, $product_data);
+        
+        $this->log_info('Created product: ' . $product_data['name'] . ' (SKU: ' . $product_data['sku'] . ')');
+    }
+    
+    /**
+     * Update existing product
+     */
+    private function update_product($product_id, $product_data) {
+        global $wpdb;
+        
+        $wpdb->update(
+            $wpdb->posts,
+            [
+                'post_title'   => $product_data['name'],
+                'post_name'    => $product_data['slug'],
+                'post_content' => $product_data['description'],
+                'post_modified' => current_time('mysql')
+            ],
+            ['ID' => $product_id]
+        );
+        
+        $this->update_product_meta($product_id, $product_data);
+        $this->process_product_categories($product_id, $product_data);
+        $this->process_product_images($product_id, $product_data);
+        
+        $this->log_info('Updated product: ' . $product_data['name'] . ' (SKU: ' . $product_data['sku'] . ')');
+    }
+    
+    /**
+     * Update product meta data
+     */
+    private function update_product_meta($product_id, $product_data) {
+        $this->update_fast_meta($product_id, '_sku', $product_data['sku']);
+        $this->update_fast_meta($product_id, '_regular_price', $product_data['price']);
+        $this->update_fast_meta($product_id, '_price', $product_data['price']);
+        $this->update_fast_meta($product_id, '_manage_stock', 'yes');
+        $this->update_fast_meta($product_id, '_stock_status', $product_data['stock_quantity'] > 0 ? 'instock' : 'outofstock');
+        $this->update_fast_meta($product_id, '_stock', $product_data['stock_quantity']);
+        
+        // Store manufacturer as product attribute
+        if (!empty($product_data['manufacturer'])) {
+            $this->update_fast_meta($product_id, 'manufacturer', $product_data['manufacturer']);
+        }
+    }
+    
+    /**
+     * Process product categories
+     */
+    private function process_product_categories($product_id, $product_data) {
+        if (empty($product_data['category_name'])) {
+            return;
+        }
+        
+        $category_id = 0;
+        $category_name = $product_data['category_name'];
+        
+        $term = term_exists($category_name, 'product_cat');
+        if (!$term) {
+            $term = wp_insert_term($category_name, 'product_cat');
+        }
+        
+        if (!is_wp_error($term)) {
+            $category_id = (int) $term['term_id'];
+            wp_set_post_terms($product_id, [$category_id], 'product_cat', false);
+        }
+    }
+    
+    /**
+     * Process product images
+     */
+    private function process_product_images($product_id, $product_data) {
+        if (empty($product_data['image_urls_raw'])) {
+            return;
+        }
+        
+        $featured_url = '';
+        $gallery_urls = [];
+        $urls = array_map('trim', explode(',', $product_data['image_urls_raw']));
+        
+        if (!empty($urls)) {
+            $featured_url = array_shift($urls);
+            $gallery_urls = $urls;
+        }
+        
+        // Store external image URLs as meta (you can implement image download later)
+        if ($featured_url) {
+            $this->update_fast_meta($product_id, '_external_image_url', $featured_url);
+        }
+        
+        if (!empty($gallery_urls)) {
+            $this->update_fast_meta($product_id, '_external_gallery_urls', implode(',', $gallery_urls));
+        }
+    }
+    
+    /**
+     * Fast meta update/insert function (from your original code)
+     */
+    private function update_fast_meta($post_id, $key, $value) {
+        global $wpdb;
+        
+        $exists = $wpdb->get_var($wpdb->prepare(
+            "SELECT meta_id FROM {$wpdb->postmeta} WHERE post_id=%d AND meta_key=%s",
+            $post_id, $key
+        ));
+        
+        if ($exists) {
+            $wpdb->update($wpdb->postmeta, ['meta_value' => $value], ['meta_id' => $exists]);
+        } else {
+            $wpdb->insert($wpdb->postmeta, [
+                'post_id'    => $post_id,
+                'meta_key'   => $key,
+                'meta_value' => $value
+            ]);
+        }
+    }
+    
+    /**
+     * Logging functions
+     */
+    private function ensure_log_directory() {
+        $log_dir = WP_CONTENT_DIR . '/uploads/wc-import-logs/';
+        
+        if (!file_exists($log_dir)) {
+            wp_mkdir_p($log_dir);
+        }
+        
+        // Add index.html to prevent directory listing
+        $index_file = $log_dir . 'index.html';
+        if (!file_exists($index_file)) {
+            file_put_contents($index_file, '<!-- Silence is golden -->');
+        }
+    }
+    
+    private function log_info($message) {
+        $this->log('INFO', $message);
+    }
+    
+    private function log_error($message) {
+        $this->log('ERROR', $message);
+        $this->errors[] = $message;
+    }
+    
+    private function log($level, $message) {
+        $timestamp = date('Y-m-d H:i:s');
+        $log_entry = "[$timestamp] [$level] $message" . PHP_EOL;
+        
+        file_put_contents($this->log_file, $log_entry, FILE_APPEND | LOCK_EX);
+    }
+    
+    /**
+     * Finalize import and output results
+     */
+    private function finalize_import() {
+        $execution_time = microtime(true) - $this->start_time;
+        $memory_used = memory_get_peak_usage(true) / 1024 / 1024;
+        
+        $this->log_info('Import completed in ' . round($execution_time, 2) . ' seconds');
+        $this->log_info('Peak memory usage: ' . round($memory_used, 2) . 'MB');
+        $this->log_info('Total products processed: ' . $this->total_processed);
+        $this->log_info('New products created: ' . $this->created);
+        $this->log_info('Products updated: ' . $this->updated);
+        
+        if (!empty($this->errors)) {
+            $this->log_info('Errors encountered: ' . count($this->errors));
+            foreach ($this->errors as $error) {
+                $this->log_error($error);
+            }
+        }
+        
+        // Output results
+        echo "🏁 IMPORT COMPLETE!\n";
+        echo "⏱️  Time: " . round($execution_time, 2) . " seconds\n";
+        echo "💾 Memory: " . round($memory_used, 2) . "MB\n";
+        echo "📊 Total processed: " . $this->total_processed . "\n";
+        echo "🆕 New products: " . $this->created . "\n";
+        echo "🔄 Updated products: " . $this->updated . "\n";
+        
+        if (!empty($this->errors)) {
+            echo "❌ Errors: " . count($this->errors) . " (check log for details)\n";
+        }
+    }
+}
+
+// ==== USAGE ====
+// Run directly from command line or include in your script
+
+// Check if running from command line
+if (php_sapi_name() === 'cli' && defined('WP_CLI') && WP_CLI) {
+    // WP-CLI command
+    WP_CLI::add_command('wc-fast-import', function($args, $assoc_args) {
+        $csv_file = isset($args[0]) ? $args[0] : '';
+        $batch_size = isset($assoc_args['batch-size']) ? (int)$assoc_args['batch-size'] : 500;
+        
+        if (empty($csv_file)) {
+            WP_CLI::error('Please provide a CSV file path');
+            return;
+        }
+        
+        if (!file_exists($csv_file)) {
+            WP_CLI::error('CSV file not found: ' . $csv_file);
+            return;
+        }
+        
+        $importer = new Enhanced_WC_Importer($csv_file);
+        $importer->batch_size = $batch_size;
+        
+        WP_CLI::log('Starting import from: ' . $csv_file);
+        WP_CLI::log('Batch size: ' . $batch_size);
+        
+        $result = $importer->import_products();
+        
+        if ($result) {
+            WP_CLI::success('Import completed successfully!');
+        } else {
+            WP_CLI::error('Import failed. Check log for details.');
+        }
+    });
+} else {
+    // Run directly
+    $csv_file = '/var/www/vhosts/omarket.gr/httpdocs/var/import/kadro3test.csv';
+    $batch_size = 500;
+    
+    $importer = new Enhanced_WC_Importer($csv_file);
+    $importer->batch_size = $batch_size;
+    $importer->import_products();
+}
