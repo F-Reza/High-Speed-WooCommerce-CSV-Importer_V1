@@ -1,0 +1,193 @@
+I will Explain to you:
+
+Its very simple,
+I Make 3 Plugin 'High-Speed WooCommerce CSV Importer'
+
+1) Fast-Importer_V1
+2) Fast-Importer_V2
+3) Fast-Importer_V3
+
+
+START
+-------------------------------------------------------
+If you Install Fast-Importer_V1:
+
+✅ You Can:
+-> Added CSV Path setting to plugin settings page.
+-> Manual import now falls back to CSV path if no file is selected.
+-> Can Import CSV Path and Also Manual import Both Work.
+-> Batch Size Like 200,300,500 to 1000 etc
+-> Cron import now uses the configured CSV path.
+-> Fully compatible with large CSV files (300k rows) using batching.
+-> No need to change hardcoded paths in the future.
+
+
+
+If you Install Fast-Importer_V2:
+
+✅ You Can:
+-> Added CSV Path setting to plugin settings page.
+-> Automatic CSV path import (var/import/products.csv)
+-> No manual file upload required
+-> Added CSV Path setting (hs_wc_importer_settings[csv_path]).
+-> Admin page shows configured CSV path and one “Start Import Now” button.
+-> Cron import uses the CSV path automatically.
+-> Fully compatible with huge CSV files (300k+ rows) using batch processing.
+
+
+
+
+If you Install Fast-Importer_V3:
+
+If you want to run the import via SSH every time and just update the CSV path in the plugin settings, we can simplify the plugin even further for CLI/SSH usage.
+
+✅ You Can:
+-> Upload plugin to wp-content/plugins/hs-wc-importer/  or Add plugin manual.
+-> Activate plugin in WordPress
+-> Set CSV path in plugin settings (e.g., /httpdocs/var/import/products.csv)
+-> Run via SSH / WP-CLI:
+
+wp wc-import
+# optional: batch size
+wp wc-import --batch-size=500
+
+-> Check logs: wp-content/uploads/wc-import-logs/
+
+
+
+✅ for SSH/CLI usage:
+-> Remove file upload form — no manual upload needed.
+-> CLI / SSH-ready import — run wp eval-file import.php or WP-CLI command.
+-> Use CSV path from settings — you can change it anytime in the settings.
+-> Batch processing — optimized for 300k+ rows.
+-> Logging — keeps full logs in wp-content/uploads/wc-import-logs/.
+
+-------------------------------------------------------
+END
+
+
+
+
+
+
+Extra: Note
+---------------------
+
+IF You'll just install it and run it, You'll change it every time and run it with ssh. csv path and and run it directly with ssh>> nohup /opt/plesk/php/8.2/bin/php /var/www/vhosts/omarket.gr/httpdocs/xmldeedsbestprice/var_shopflixtestbest.php > /var/www/vhosts/omarket.gr/httpdocs/xmldeedsbestprice/var_shopflixtestbest.log
+
+
+IF you want to run it directly via SSH using PHP CLI and change the CSV path manually each time, we can simplify things so the plugin can also work as a standalone PHP script. Here’s how you can do it:
+
+✅ Prepare the standalone import script
+
+Create a file, for example:
+
+/var/www/vhosts/omarket.gr/httpdocs/xmldeedsbestprice/var_shopflixtestbest.php
+
+
+✅ Use this simplified, SSH-ready script:
+
+<?php
+require_once '/var/www/vhosts/omarket.gr/httpdocs/wp-load.php';
+require_once ABSPATH . 'wp-admin/includes/admin.php';
+require_once ABSPATH . 'wp-admin/includes/image.php';
+require_once ABSPATH . 'wp-admin/includes/file.php';
+require_once ABSPATH . 'wp-admin/includes/media.php';
+
+ini_set('memory_limit', '4G');
+set_time_limit(0);
+
+$csv_path = '/var/www/vhosts/omarket.gr/httpdocs/xmldeedsbestprice/var/import/products.csv'; // CHANGE THIS EACH TIME
+$batch_size = 500; // adjust as needed
+$log_file = '/var/www/vhosts/omarket.gr/httpdocs/xmldeedsbestprice/var_shopflixtestbest.log';
+
+function log_msg($msg) {
+    global $log_file;
+    file_put_contents($log_file, date('[Y-m-d H:i:s] ') . $msg . PHP_EOL, FILE_APPEND);
+}
+
+if (!file_exists($csv_path)) {
+    log_msg("CSV file not found: $csv_path");
+    exit;
+}
+
+log_msg("Starting import from: $csv_path");
+
+$handle = fopen($csv_path, 'r');
+if (!$handle) { log_msg("Could not open CSV file."); exit; }
+
+$header = fgetcsv($handle, 0, ',', '"');
+if (!$header) { log_msg("CSV header not readable."); exit; }
+
+$total = 0;
+$batch_count = 0;
+
+while (!feof($handle)) {
+    $batch_data = [];
+    $count = 0;
+    while ($count < $batch_size && ($row = fgetcsv($handle, 0, ',', '"')) !== FALSE) {
+        if (count($row) === count($header)) {
+            $batch_data[] = array_combine($header, $row);
+            $count++;
+        }
+    }
+
+    foreach ($batch_data as $data) {
+        $sku = sanitize_text_field($data['sku']);
+        if (empty($sku)) continue;
+
+        $product_data = [
+            'name' => sanitize_text_field($data['name']),
+            'sku' => $sku,
+            'price' => wc_format_decimal($data['price']),
+            'stock_quantity' => intval($data['stock_quantity']),
+            'manage_stock' => !empty($data['stock_quantity']),
+            'stock_status' => !empty($data['stock_quantity']) ? 'instock' : 'outofstock',
+        ];
+
+        $existing_id = $wpdb->get_var($wpdb->prepare(
+            "SELECT post_id FROM {$wpdb->postmeta} WHERE meta_key='_sku' AND meta_value=%s LIMIT 1",
+            $sku
+        ));
+
+        if ($existing_id) {
+            $product = wc_get_product($existing_id);
+            $product->set_name($product_data['name']);
+            $product->set_price($product_data['price']);
+            $product->set_manage_stock($product_data['manage_stock']);
+            if ($product_data['manage_stock']) $product->set_stock_quantity($product_data['stock_quantity']);
+            $product->set_stock_status($product_data['stock_status']);
+            $product->save();
+        } else {
+            $product = new WC_Product();
+            $product->set_name($product_data['name']);
+            $product->set_sku($product_data['sku']);
+            $product->set_price($product_data['price']);
+            $product->set_manage_stock($product_data['manage_stock']);
+            if ($product_data['manage_stock']) $product->set_stock_quantity($product_data['stock_quantity']);
+            $product->set_stock_status($product_data['stock_status']);
+            $product->save();
+        }
+        $total++;
+    }
+    $batch_count++;
+    unset($batch_data);
+    gc_collect_cycles();
+}
+
+fclose($handle);
+log_msg("Import finished. Total products processed: $total. Batches: $batch_count.");
+
+
+
+✅ Run via SSH:
+nohup /opt/plesk/php/8.2/bin/php 
+/var/www/vhosts/omarket.gr/httpdocs/xmldeedsbestprice/var_shopflixtestbest.php > /var/www/vhosts/omarket.gr/httpdocs/xmldeedsbestprice/var_shopflixtestbest.log 2>&1 &
+
+
+
+✅ Advantages:
+-> Handles large CSVs (300k+ rows) in batches.
+-> Fully CLI/SSH ready.
+-> Easy to update CSV path each time.
+-> Logs progress in a single log file.
