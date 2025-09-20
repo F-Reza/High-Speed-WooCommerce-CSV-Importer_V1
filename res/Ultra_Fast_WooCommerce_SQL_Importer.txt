@@ -1,0 +1,120 @@
+<?php
+/**
+ * Ultra-Fast WooCommerce SQL Importer
+ * Direct SQL bulk inserts from CSV (no WooCommerce CRUD)
+ */
+
+require_once('/var/www/vhosts/omarket.gr/httpdocs/wp-load.php');
+global $wpdb;
+
+// ==== CONFIG ====
+$csvFile    = '/var/www/vhosts/omarket.gr/httpdocs/var/import/kadro5test.csv';
+$batch_size = 5000;
+ini_set('memory_limit', '8G');
+set_time_limit(0);
+
+if (!file_exists($csvFile)) {
+    exit("❌ CSV not found: $csvFile\n");
+}
+
+$handle = fopen($csvFile, "r");
+$header = fgetcsv($handle, 0, ","); // read header
+$row_count = 0;
+$total_created = 0;
+$total_updated = 0;
+
+while (($rows = read_batch($handle, $batch_size, $header)) && count($rows) > 0) {
+    $values_posts = [];
+    $values_meta  = [];
+
+    foreach ($rows as $data) {
+        $description    = trim($data['description']);
+        $name           = trim($data['name']);
+        $sku            = trim($data['sku']);
+        $image_urls_raw = trim($data['images']);
+        $price          = floatval(str_replace(',', '.', $data['price']));
+        $category_name  = trim($data['category']);
+        $stock_quantity = intval($data['stock_quantity']);
+        $manufacturer   = trim($data['manufacturer']);
+        $slug           = sanitize_title($name);
+
+        if (empty($sku)) continue;
+
+        // insert into posts
+        $values_posts[] = $wpdb->prepare(
+            "(%s,%s,%s,'publish','product',1,%s)",
+            $name, $slug, $description, current_time('mysql')
+        );
+
+        // capture meta for later
+        $values_meta[$sku] = [
+            '_sku'          => $sku,
+            '_price'        => $price,
+            '_regular_price'=> $price,
+            '_manage_stock' => 'yes',
+            '_stock'        => $stock_quantity,
+            '_stock_status' => $stock_quantity > 0 ? 'instock' : 'outofstock',
+            '_external_image_url'    => $image_urls_raw,
+            '_product_version'       => WC_VERSION,
+        ];
+    }
+
+    // === Bulk insert posts ===
+    if (!empty($values_posts)) {
+        $sql_posts = "
+        INSERT INTO {$wpdb->posts}
+        (post_title, post_name, post_content, post_status, post_type, post_author, post_date)
+        VALUES " . implode(",", $values_posts) . "
+        ON DUPLICATE KEY UPDATE post_title=VALUES(post_title),
+            post_name=VALUES(post_name),
+            post_content=VALUES(post_content),
+            post_status='publish'";
+        $wpdb->query($sql_posts);
+        $inserted = $wpdb->rows_affected;
+        $total_created += $inserted;
+    }
+
+    // === Bulk insert postmeta ===
+    foreach ($values_meta as $sku => $metas) {
+        $post_id = $wpdb->get_var($wpdb->prepare(
+            "SELECT post_id FROM {$wpdb->postmeta} WHERE meta_key='_sku' AND meta_value=%s LIMIT 1",
+            $sku
+        ));
+
+        if (!$post_id) {
+            // get last inserted post
+            $post_id = $wpdb->get_var("SELECT MAX(ID) FROM {$wpdb->posts}");
+        }
+
+        foreach ($metas as $key => $val) {
+            $wpdb->query($wpdb->prepare(
+                "INSERT INTO {$wpdb->postmeta} (post_id, meta_key, meta_value)
+                 VALUES (%d, %s, %s)
+                 ON DUPLICATE KEY UPDATE meta_value=VALUES(meta_value)",
+                $post_id, $key, $val
+            ));
+        }
+    }
+
+    $row_count += count($rows);
+    echo "✅ Imported so far: $row_count rows\n";
+}
+
+fclose($handle);
+
+echo "🏁 DONE: Total rows: $row_count | Created: $total_created\n";
+
+/**
+ * Read batch rows from CSV
+ */
+function read_batch($handle, $batch_size, $header) {
+    $batch = [];
+    $count = 0;
+    while ($count < $batch_size && ($row = fgetcsv($handle, 0, ",")) !== false) {
+        if (count($row) === count($header)) {
+            $batch[] = array_combine($header, $row);
+            $count++;
+        }
+    }
+    return $batch;
+}
