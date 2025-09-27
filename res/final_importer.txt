@@ -1,0 +1,371 @@
+<?php
+/**
+* WooCommerce CSV Importer (Turbo Simplified + Brands + Categories + Stock)
+* - ΜΟΝΟ crop ποσοστιαίο (default 5% περιμετρικά)
+* - Imagick resize + compression
+* - Υποστήριξη Featured + Gallery Images
+* - Εισαγωγή Brands (taxonomy: product_brand)
+* - Εισαγωγή Categories (Γενική Κατηγορία => parent, Υποκατηγορία => child)
+* - Ενημέρωση αποθέματος: stock_quantity, stock_status, _manage_stock
+*/
+
+require_once('/var/www/vhosts/omarket.gr/httpdocs/wp-load.php');
+
+// ==== ERROR REPORTING ====
+error_reporting(E_ALL);
+ini_set('display_errors', 1);
+ini_set('log_errors', 1);
+ini_set('error_log', '/var/www/vhosts/omarket.gr/httpdocs/eikones/part_1ΕΤΟΙΜΟ.log');
+
+set_error_handler(function($errno, $errstr, $errfile, $errline) {
+error_log("❌ PHP Error [$errno] $errstr in $errfile on line $errline");
+return false;
+});
+set_exception_handler(function($e) {
+error_log("❌ Uncaught Exception: " . $e->getMessage() . " in " . $e->getFile() . " line " . $e->getLine());
+});
+
+// ==== Imagick check ====
+$imagick_ok = extension_loaded('imagick');
+if ($imagick_ok) error_log("✅ Imagick extension ενεργό.");
+else error_log("⚠️ Imagick extension ΔΕΝ φορτώθηκε.");
+
+// ==== ΡΥΘΜΙΣΕΙΣ ====
+$csvFile = '/var/www/vhosts/omarket.gr/httpdocs/eikones/part_1ΕΤΟΙΜΟ.csv';
+$batch_size = 30;
+$rate_usleep = 200000; // 0.2s ανά εικόνα
+$sleep_every = 50;
+ini_set('memory_limit', '7024M');
+set_time_limit(0);
+
+// ==== SKU MAP ====
+global $wpdb;
+$sku_map = [];
+$results = $wpdb->get_results("SELECT p.ID, pm.meta_value as sku
+FROM {$wpdb->posts} p
+JOIN {$wpdb->postmeta} pm ON p.ID = pm.post_id
+WHERE pm.meta_key = '_sku'");
+foreach ($results as $row) {
+if ($row->sku) $sku_map[$row->sku] = $row->ID;
+}
+
+// ==== Brand Taxonomy ====
+$brand_tax = 'product_brand';
+if (!taxonomy_exists($brand_tax)) {
+register_taxonomy($brand_tax, 'product', [
+'hierarchical' => false,
+'label' => 'Brands',
+'query_var' => true,
+'rewrite' => ['slug' => 'product_brand'],
+]);
+}
+
+// ==== Image Cache ====
+$image_cache = [];
+
+// ==== Defer counting ====
+wp_defer_term_counting(true);
+wp_defer_comment_counting(true);
+
+if (!file_exists($csvFile)) {
+error_log("❌ Το αρχείο CSV δεν βρέθηκε: $csvFile");
+exit;
+}
+error_log("✅ CSV file βρέθηκε: $csvFile");
+
+// ==== Safe unlink ====
+function safe_unlink($file) {
+if ($file && file_exists($file)) {
+@unlink($file);
+}
+}
+
+// ==== Attach Image με ποσοστιαίο crop ====
+function attach_hybrid_image($image_url) {
+global $image_cache, $imagick_ok;
+
+if (isset($image_cache[$image_url])) {
+return $image_cache[$image_url];
+}
+
+$upload_dir = wp_upload_dir();
+$tmp_file = tempnam(sys_get_temp_dir(), 'img_');
+
+// λήψη αρχείου
+$ch = curl_init($image_url);
+$fp = fopen($tmp_file, "wb");
+curl_setopt($ch, CURLOPT_FILE, $fp);
+curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
+curl_setopt($ch, CURLOPT_TIMEOUT, 60);
+curl_exec($ch);
+$http_code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+curl_close($ch);
+fclose($fp);
+
+if ($http_code != 200 || !file_exists($tmp_file) || filesize($tmp_file) < 1000) {
+error_log("❌ HTTP $http_code fetching $image_url");
+safe_unlink($tmp_file);
+return 0;
+}
+
+$processed = $tmp_file;
+
+// === Imagick crop ποσοστιαίο ===
+if ($imagick_ok) {
+try {
+$imagick = new Imagick($processed);
+$imagick->setImageFormat('jpeg');
+$imagick->setImageCompressionQuality(85);
+$imagick->stripImage();
+
+$width = $imagick->getImageWidth();
+$height = $imagick->getImageHeight();
+
+// Crop 5% περιμετρικά (όπως ζητήθηκε)
+$percent = 0.0;
+$marginX = (int)($width * $percent);
+$marginY = (int)($height * $percent);
+
+$new_w = max(1, $width - 2 * $marginX);
+$new_h = max(1, $height - 2 * $marginY);
+
+if ($new_w < $width && $new_h < $height) {
+$imagick->cropImage($new_w, $new_h, $marginX, $marginY);
+$imagick->setImagePage(0, 0, 0, 0);
+error_log("✅ Cropped " . ($percent*100) . "% all sides: $image_url ($new_w x $new_h)");
+}
+
+if ($imagick->getImageWidth() > 1200) {
+$imagick->resizeImage(1200, 0, Imagick::FILTER_LANCZOS, 1);
+}
+
+$imagick->writeImage($processed);
+$imagick->destroy();
+} catch (Exception $e) {
+error_log("⚠️ Imagick exception: " . $e->getMessage());
+}
+}
+
+// αποθήκευση στο WP
+$filename = basename(parse_url($image_url, PHP_URL_PATH));
+// ensure unique filename (avoid overwrite)
+$filename = time() . '_' . preg_replace('/[^A-Za-z0-9\-\_\.]/', '_', $filename);
+$wp_file = $upload_dir['path'] . '/' . $filename;
+copy($processed, $wp_file);
+
+$attachment = [
+'guid' => $upload_dir['url'] . '/' . basename($wp_file),
+'post_mime_type' => 'image/jpeg',
+'post_title' => preg_replace('/\.[^.]+$/', '', $filename),
+'post_content' => '',
+'post_status' => 'inherit'
+];
+
+$attach_id = wp_insert_attachment($attachment, $wp_file, 0);
+require_once(ABSPATH . 'wp-admin/includes/image.php');
+$attach_data = wp_generate_attachment_metadata($attach_id, $wp_file);
+wp_update_attachment_metadata($attach_id, $attach_data);
+
+// cleanup tmp
+safe_unlink($tmp_file);
+
+$image_cache[$image_url] = $attach_id;
+return $attach_id;
+}
+
+// ==== MAIN CSV LOOP ====
+if (($handle = fopen($csvFile, "r")) !== false) {
+// read header and build case-insensitive index (trim + mb_strtolower)
+$header = fgetcsv($handle);
+$idx = [];
+if (is_array($header)) {
+foreach ($header as $k => $v) {
+$key = mb_strtolower(trim($v), 'UTF-8');
+$idx[$key] = $k;
+}
+}
+
+// expected keys (lowercase)
+$expected_keys = [
+'title','sku','περιγραφή','τιμή','image url','manufacturer',
+'γενική κατηγορία','υποκατηγορία','stock_status','stock_quantity'
+];
+
+// log missing expected keys (if any)
+foreach ($expected_keys as $ek) {
+if (!isset($idx[mb_strtolower($ek, 'UTF-8')])) {
+error_log("⚠️ Προσοχή: header '$ek' δεν βρέθηκε στο CSV (case-insensitive check).");
+}
+}
+
+$row_count = 0;
+$created = 0;
+$updated = 0;
+
+while (($data = fgetcsv($handle)) !== false) {
+// Helper to fetch cell by case-insensitive header
+$get = function($name) use ($idx, $data) {
+$k = mb_strtolower($name, 'UTF-8');
+if (isset($idx[$k]) && isset($data[$idx[$k]])) return trim($data[$idx[$k]]);
+return '';
+};
+
+$name = $get('title');
+$sku = $get('sku');
+$desc = $get('Περιγραφή');
+$price = $get('Τιμή') !== '' ? floatval(str_replace(',', '.', $get('Τιμή'))) : 0;
+$image_field = $get('Image URL');
+$manufacturer = $get('manufacturer');
+
+// Category fields
+$main_cat = $get('Γενική Κατηγορία');
+$sub_cat = $get('Υποκατηγορία');
+
+// Stock fields
+$stock_qty = $get('stock_quantity') !== '' ? intval($get('stock_quantity')) : null;
+$stock_status = $get('stock_status') !== '' ? strtolower($get('stock_status')) : '';
+
+error_log("ℹ️ Επεξεργασία προϊόντος SKU: $sku | Title: $name");
+
+// Images
+$featured_id = 0;
+$gallery_ids = [];
+if ($image_field) {
+$urls = array_filter(array_map('trim', explode(',', $image_field)));
+foreach ($urls as $i => $url) {
+$img_id = attach_hybrid_image($url);
+if ($img_id) {
+if ($i === 0) $featured_id = $img_id;
+else $gallery_ids[] = $img_id;
+}
+usleep($rate_usleep);
+}
+}
+
+// If product exists -> update, else create
+if ($sku && isset($sku_map[$sku])) {
+$pid = $sku_map[$sku];
+wp_update_post([
+'ID' => $pid,
+'post_title' => $name,
+'post_content' => $desc,
+'post_status' => 'publish'
+]);
+update_post_meta($pid, '_sku', $sku);
+update_post_meta($pid, '_regular_price', $price);
+update_post_meta($pid, '_price', $price);
+if ($featured_id) set_post_thumbnail($pid, $featured_id);
+if (!empty($gallery_ids)) update_post_meta($pid, '_product_image_gallery', implode(',', $gallery_ids));
+
+// === Brand ===
+if ($manufacturer) {
+$term = term_exists($manufacturer, $brand_tax);
+if (!$term) {
+$term = wp_insert_term($manufacturer, $brand_tax);
+}
+if (!is_wp_error($term)) {
+wp_set_object_terms($pid, intval($term['term_id']), $brand_tax, false);
+}
+}
+
+// === Categories ===
+$cat_ids = [];
+if ($main_cat) {
+$term = term_exists($main_cat, 'product_cat');
+if (!$term) {
+$term = wp_insert_term($main_cat, 'product_cat');
+}
+if (!is_wp_error($term)) {
+$cat_ids[] = intval($term['term_id']);
+// subcategory as child
+if ($sub_cat) {
+$term_sub = term_exists($sub_cat, 'product_cat');
+if (!$term_sub) {
+$term_sub = wp_insert_term($sub_cat, 'product_cat', ['parent' => intval($term['term_id'])]);
+} else {
+// if exists but parent different, try to set parent (best-effort)
+if (isset($term_sub['term_id']) && intval($term_sub['term_id']) && !is_wp_error($term_sub)) {
+// nothing to change here programmatically without deeper checks
+}
+}
+if (!is_wp_error($term_sub)) {
+$cat_ids[] = intval($term_sub['term_id']);
+}
+}
+}
+} elseif ($sub_cat) {
+// If only subcategory is provided, create it (parent=0)
+$term_sub = term_exists($sub_cat, 'product_cat');
+if (!$term_sub) {
+$term_sub = wp_insert_term($sub_cat, 'product_cat');
+}
+if (!is_wp_error($term_sub)) {
+$cat_ids[] = intval($term_sub['term_id']);
+}
+}
+
+if (!empty($cat_ids)) {
+wp_set_object_terms($pid, $cat_ids, 'product_cat', false);
+}
+
+// === Stock ===
+if ($stock_qty !== null) {
+update_post_meta($pid, '_manage_stock', 'yes');
+update_post_meta($pid, '_stock', $stock_qty);
+}
+if ($stock_status) {
+// normalize possible values
+$allowed = ['instock', 'outofstock', 'onbackorder'];
+$st = in_array($stock_status, $allowed) ? $stock_status : ($stock_qty > 0 ? 'instock' : 'outofstock');
+update_post_meta($pid, '_stock_status', $st);
+} elseif ($stock_qty !== null) {
+// if status not provided, set based on qty
+$st = ($stock_qty > 0) ? 'instock' : 'outofstock';
+update_post_meta($pid, '_stock_status', $st);
+}
+
+$updated++;
+error_log("🔄 Ενημερώθηκε προϊόν $sku (ID=$pid)");
+} else {
+// create
+$pid = wp_insert_post([
+'post_title' => $name,
+'post_content' => $desc,
+'post_status' => 'publish',
+'post_type' => 'product'
+]);
+update_post_meta($pid, '_sku', $sku);
+update_post_meta($pid, '_regular_price', $price);
+update_post_meta($pid, '_price', $price);
+if ($featured_id) set_post_thumbnail($pid, $featured_id);
+if (!empty($gallery_ids)) update_post_meta($pid, '_product_image_gallery', implode(',', $gallery_ids));
+
+// === Brand ===
+if ($manufacturer) {
+$term = term_exists($manufacturer, $brand_tax);
+if (!$term) {
+$term = wp_insert_term($manufacturer, $brand_tax);
+}
+if update_post_meta($pid, '_manage_stock', 'no');
+update_post_meta($pid, '_stock_status', 'instock');
+}
+
+$sku_map[$sku] = $pid;
+$created++;
+error_log("✅ Δημιουργήθηκε προϊόν $sku (ID=$pid)");
+}
+
+$row_count++;
+if ($row_count % $batch_size === 0) {
+sleep(1);
+error_log("ℹ️ Progress: $created νέα | $updated ενημερωμένα");
+}
+}
+fclose($handle);
+}
+
+// ==== Τέλος ====
+wp_defer_term_counting(false);
+wp_defer_comment_counting(false);
+
+error_log("🏁 Τέλος εισαγωγής: $created νέα | $updated ενημερωμένα");

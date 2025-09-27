@@ -1,0 +1,188 @@
+<?php
+/**
+ * Ultra-Fast WooCommerce SQL Importer with Logging
+ * SKU-aware + categories + brands + gallery images
+ */
+
+require_once('/var/www/vhosts/omarket.gr/httpdocs/wp-load.php');
+global $wpdb;
+
+// ==== CONFIG ====
+$csvFile = '/var/www/vhosts/omarket.gr/httpdocs/var/import/kadro5test.csv';
+$batch_size = 2000;
+ini_set('memory_limit', '8G');
+set_time_limit(0);
+
+// ==== LOG FILE ====
+$logFile = __DIR__ . '/import_log.txt'; // file in same folder as script
+
+// ==== LOG HELPER ====
+function write_log($message) {
+    global $logFile;
+    $time = date('Y-m-d H:i:s');
+    file_put_contents($logFile, "[$time] $message\n", FILE_APPEND);
+}
+
+// ==== CHECK CSV ====
+if (!file_exists($csvFile)) {
+    $msg = "❌ CSV not found: $csvFile";
+    echo $msg . "\n";
+    write_log($msg);
+    exit;
+}
+
+// ==== OPEN CSV ====
+$handle = fopen($csvFile, "r");
+$header = fgetcsv($handle, 0, ",");
+
+$row_count = 0;
+$total_created = 0;
+$total_updated = 0;
+
+// ==== PROCESS BATCHES ====
+while (($rows = read_batch($handle, $batch_size, $header)) && count($rows) > 0) {
+    foreach ($rows as $data) {
+        $description     = trim($data['Περιγραφή']);
+        $name            = trim($data['title']);
+        $sku             = trim($data['sku']);
+        $image_urls_raw  = trim($data['Image URL']);
+        $price           = floatval(str_replace(',', '.', $data['price']));
+        $category_name   = trim($data['categorie']);
+        $stock_quantity  = intval($data['stock_quantity']);
+        $manufacturer    = trim($data['manufacturer']);
+
+        if (empty($sku)) {
+            write_log("⚠️ Skipped row #$row_count: empty SKU | Name: $name");
+            continue;
+        }
+
+        // === Always unique slug ===
+        $slug = sanitize_title($name . '-' . $sku);
+
+        // === Split images ===
+        $featured_url = '';
+        $gallery_urls = [];
+        if (!empty($image_urls_raw)) {
+            $urls = array_map('trim', explode(',', $image_urls_raw));
+            $featured_url = array_shift($urls); // first = featured
+            $gallery_urls = $urls; // rest = gallery
+        }
+
+        // === Check if SKU exists ===
+        $product_id = $wpdb->get_var($wpdb->prepare(
+            "SELECT post_id FROM {$wpdb->postmeta} WHERE meta_key='_sku' AND meta_value=%s LIMIT 1",
+            $sku
+        ));
+
+        if ($product_id) {
+            // === UPDATE ===
+            $wpdb->update(
+                $wpdb->posts,
+                [
+                    'post_title'   => $name,
+                    'post_name'    => $slug,
+                    'post_content' => $description,
+                    'post_status'  => 'publish'
+                ],
+                ['ID' => $product_id]
+            );
+
+            update_fast_meta($product_id, '_regular_price', $price);
+            update_fast_meta($product_id, '_price', $price);
+            update_fast_meta($product_id, '_manage_stock', 'yes');
+            update_fast_meta($product_id, '_stock', $stock_quantity);
+            update_fast_meta($product_id, '_stock_status', $stock_quantity > 0 ? 'instock' : 'outofstock');
+            if ($featured_url) update_fast_meta($product_id, '_external_image_url', $featured_url);
+            if (!empty($gallery_urls)) update_fast_meta($product_id, '_external_gallery_urls', implode(',', $gallery_urls));
+
+            write_log("✅ Updated product SKU: $sku | ID: $product_id");
+            $total_updated++;
+        } else {
+            // === CREATE ===
+            $wpdb->insert($wpdb->posts, [
+                'post_title'   => $name,
+                'post_name'    => $slug,
+                'post_content' => $description,
+                'post_status'  => 'publish',
+                'post_type'    => 'product',
+                'post_author'  => 1,
+                'post_date'    => current_time('mysql')
+            ]);
+
+            $product_id = $wpdb->insert_id;
+
+            if ($product_id) {
+                update_fast_meta($product_id, '_sku', $sku);
+                update_fast_meta($product_id, '_regular_price', $price);
+                update_fast_meta($product_id, '_price', $price);
+                update_fast_meta($product_id, '_manage_stock', 'yes');
+                update_fast_meta($product_id, '_stock', $stock_quantity);
+                update_fast_meta($product_id, '_stock_status', $stock_quantity > 0 ? 'instock' : 'outofstock');
+                if ($featured_url) update_fast_meta($product_id, '_external_image_url', $featured_url);
+                if (!empty($gallery_urls)) update_fast_meta($product_id, '_external_gallery_urls', implode(',', $gallery_urls));
+
+                write_log("✅ Created product SKU: $sku | ID: $product_id");
+                $total_created++;
+            } else {
+                write_log("❌ Failed to create product SKU: $sku | Name: $name");
+                continue;
+            }
+        }
+
+        // === Category ===
+        if (!empty($category_name)) {
+            wp_set_object_terms($product_id, $category_name, 'product_cat', false);
+        }
+
+        // === Brand ===
+        if (!empty($manufacturer)) {
+            wp_set_object_terms($product_id, $manufacturer, 'product_brand', false);
+        }
+
+        $row_count++;
+    }
+
+    echo "✅ Imported so far: $row_count | Νέα: $total_created | Ενημερώθηκαν: $total_updated\n";
+    write_log("Imported so far: $row_count | Νέα: $total_created | Ενημερώθηκαν: $total_updated");
+}
+
+fclose($handle);
+
+$summary = "🏁 DONE! Νέα: $total_created | Ενημερώθηκαν: $total_updated | Σύνολο: $row_count";
+echo $summary . "\n";
+write_log($summary);
+
+// ==========================
+// === Helper functions ====
+// ==========================
+
+/** Direct fast meta update/insert */
+function update_fast_meta($post_id, $key, $value) {
+    global $wpdb;
+    $exists = $wpdb->get_var($wpdb->prepare(
+        "SELECT meta_id FROM {$wpdb->postmeta} WHERE post_id=%d AND meta_key=%s",
+        $post_id, $key
+    ));
+    if ($exists) {
+        $wpdb->update($wpdb->postmeta, ['meta_value' => $value], ['meta_id' => $exists]);
+    } else {
+        $wpdb->insert($wpdb->postmeta, [
+            'post_id'    => $post_id,
+            'meta_key'   => $key,
+            'meta_value' => $value
+        ]);
+    }
+}
+
+/** Read CSV batch */
+function read_batch($handle, $batch_size, $header) {
+    $batch = [];
+    $count = 0;
+    while ($count < $batch_size && ($row = fgetcsv($handle, 0, ",")) !== false) {
+        if (count($row) === count($header)) {
+            $batch[] = array_combine($header, $row);
+            $count++;
+        }
+    }
+    return $batch;
+}
