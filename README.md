@@ -1,4 +1,4 @@
-# High-Speed-WooCommerce-CSV-Importer_V1
+
 # 🚀 High-Performance WooCommerce Product Importer (100K+ SKUs)
 
 A **battle-tested, high-speed WooCommerce product importer** designed for large-scale eCommerce catalogs (100,000+ SKUs).  
