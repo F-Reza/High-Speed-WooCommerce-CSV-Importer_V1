@@ -2,7 +2,7 @@
 # 🚀 High-Performance WooCommerce Product Importer (100K+ SKUs)
 
 A **battle-tested, high-speed WooCommerce product importer** designed for large-scale eCommerce catalogs (100,000+ SKUs).  
-Optimized for **CSV imports** with support for batch processing, deduplication, and background execution via **WP-CLI** or cron jobs.  
+
 
 ---
 
